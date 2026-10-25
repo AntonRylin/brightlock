@@ -23,7 +23,7 @@ namespace BrightLock
 {
     static class Program
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.0.1";
 
         [STAThread]
         static void Main(string[] args)
@@ -617,7 +617,7 @@ namespace BrightLock
     // Night light. It scales each screen's gamma ramp (like f.lux) to about 3500 K.
     // Windows refuses ramps far from neutral unless an admin setting is changed, and
     // this warmth stays inside the default limit. The screen's own ramp (calibration)
-    // is kept and restored when the filter goes off.
+    // is kept and restored when the filter goes off. HDR screens get a PQ-aware ramp (see Scale).
     static class Warm
     {
         [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateDC(string driver, string device, string output, IntPtr init);
@@ -627,6 +627,7 @@ namespace BrightLock
 
         const double Green = 0.80, Blue = 0.62;
         static readonly Dictionary<string, ushort[]> bases = new Dictionary<string, ushort[]>(StringComparer.OrdinalIgnoreCase);
+        static string lastHdrList;
 
         static IntPtr Open(string device)
         {
@@ -641,15 +642,39 @@ namespace BrightLock
             return r;
         }
 
-        static ushort[] Warmed(ushort[] b)
+        static ushort[] Warmed(ushort[] b, bool hdr)
         {
             var r = (ushort[])b.Clone();
             for (int i = 0; i < 256; i++)
             {
-                r[256 + i] = (ushort)(b[256 + i] * Green);
-                r[512 + i] = (ushort)(b[512 + i] * Blue);
+                r[256 + i] = Scale(b[256 + i], Green, hdr);
+                r[512 + i] = Scale(b[512 + i], Blue, hdr);
             }
             return r;
+        }
+
+        // In HDR the ramp works on the PQ signal, where scaling the value cuts far more light than
+        // on an SDR screen (the screen turns deep red). So for HDR, scale the light itself by what
+        // the same factor removes on SDR (gamma 2.2) and encode it back to PQ.
+        static ushort Scale(ushort v, double k, bool hdr)
+        {
+            if (!hdr) return (ushort)(v * k);
+            double light = PqToLinear(v / 65535.0) * Math.Pow(k, 2.2);
+            return (ushort)Math.Round(Math.Min(1, LinearToPq(light)) * 65535);
+        }
+
+        const double M1 = 2610.0 / 16384, M2 = 2523.0 / 4096 * 128, C1 = 3424.0 / 4096, C2 = 2413.0 / 4096 * 32, C3 = 2392.0 / 4096 * 32;
+
+        static double PqToLinear(double e)
+        {
+            double p = Math.Pow(Math.Max(e, 0), 1 / M2);
+            return Math.Pow(Math.Max(p - C1, 0) / (C2 - C3 * p), 1 / M1);
+        }
+
+        static double LinearToPq(double y)
+        {
+            double p = Math.Pow(Math.Max(y, 0), M1);
+            return Math.Pow((C1 + C2 * p) / (1 + C3 * p), M2);
         }
 
         static bool Same(ushort[] a, ushort[] b)
@@ -664,6 +689,10 @@ namespace BrightLock
         public static bool Apply(bool on)
         {
             bool any = false;
+            var hdrScreens = on ? DisplayCfg.HdrScreens() : new HashSet<string>();
+            string hdrList = string.Join(", ", hdrScreens.OrderBy(s => s));
+            if (on && hdrList != lastHdrList) Log.Write("Warm screen: HDR screens " + (hdrList.Length > 0 ? hdrList : "none"));
+            lastHdrList = on ? hdrList : null;
             foreach (var screen in Screen.AllScreens)
             {
                 var hdc = Open(screen.DeviceName);
@@ -676,10 +705,10 @@ namespace BrightLock
                     if (!bases.TryGetValue(screen.DeviceName, out b))
                     {
                         // Already tinted (left over from a crash, or another warm tool): start from neutral.
-                        b = read && now[767] > now[255] * 0.9 ? now : Identity();
+                        b = read && now[767] > now[255] * 0.97 ? now : Identity();
                         bases[screen.DeviceName] = b;
                     }
-                    var want = on ? Warmed(b) : b;
+                    var want = on ? Warmed(b, hdrScreens.Contains(screen.DeviceName)) : b;
                     if (read && Same(now, want)) { any = true; continue; }
                     if (SetDeviceGammaRamp(hdc, want)) any = true;
                     else Log.Write("Warm screen: " + screen.DeviceName + " refused the colour change");
@@ -1115,6 +1144,8 @@ namespace BrightLock
         [StructLayout(LayoutKind.Sequential)] struct COLOR_INFO { public HEADER h; public uint value; public int encoding; public uint bits; }
         [StructLayout(LayoutKind.Sequential)] struct COLOR_INFO2 { public HEADER h; public uint value; public int encoding; public uint bits; public int activeColorMode; }
         [StructLayout(LayoutKind.Sequential)] struct SET_STATE { public HEADER h; public uint value; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct SOURCE_NAME { public HEADER h; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string gdiName; }
 
         const uint QDC_ALL_PATHS = 1, QDC_ONLY_ACTIVE_PATHS = 2;
         const uint SDC_TOPOLOGY_EXTEND = 0x4, SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x20, SDC_APPLY = 0x80,
@@ -1129,6 +1160,7 @@ namespace BrightLock
         [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref COLOR_INFO info);
         [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref COLOR_INFO2 info);
         [DllImport("user32.dll")] static extern int DisplayConfigSetDeviceInfo(ref SET_STATE info);
+        [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(ref SOURCE_NAME info);
 
         public class Target
         {
@@ -1194,6 +1226,33 @@ namespace BrightLock
                         t.On = (c.value & 2) != 0;
                     }
                     result[key] = t;
+                }
+            }
+            catch { }
+            return result;
+        }
+
+        // GDI names ("\\.\DISPLAY1", as in Screen.DeviceName) of the screens running in HDR.
+        public static HashSet<string> HdrScreens()
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                PATH[] paths; MODE[] modes;
+                if (!Query(QDC_ONLY_ACTIVE_PATHS, out paths, out modes)) return result;
+                foreach (var p in paths)
+                {
+                    bool hdr;
+                    var c2 = new COLOR_INFO2 { h = Header(15, typeof(COLOR_INFO2), p.tgt.adapterId, p.tgt.id) };
+                    if (DisplayConfigGetDeviceInfo(ref c2) == 0) hdr = c2.activeColorMode == 2;
+                    else
+                    {
+                        var c = new COLOR_INFO { h = Header(9, typeof(COLOR_INFO), p.tgt.adapterId, p.tgt.id) };
+                        hdr = DisplayConfigGetDeviceInfo(ref c) == 0 && (c.value & 2) != 0;
+                    }
+                    if (!hdr) continue;
+                    var s = new SOURCE_NAME { h = Header(1, typeof(SOURCE_NAME), p.src.adapterId, p.src.id) };
+                    if (DisplayConfigGetDeviceInfo(ref s) == 0 && !string.IsNullOrEmpty(s.gdiName)) result.Add(s.gdiName);
                 }
             }
             catch { }
