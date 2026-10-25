@@ -23,7 +23,10 @@ Your monitors need DDC/CI turned on (usually on by default, otherwise in the mon
 - Tray menu: put all screens to sleep now (mouse/keyboard wakes them).
 - Starts with Windows (tray menu to turn off).
 
-Build: `.\build.ps1` (uses the C# compiler that ships with Windows). `.\build.ps1 -Install` copies to `%LOCALAPPDATA%\Programs\BrightLock` and starts it.
+## Build
+
+`.\build.ps1` builds `bin\BrightLock.exe` and `bin\BrightLock-Setup.exe` with the C# compiler that ships with Windows (no SDK needed). `.\build.ps1 -Install` also installs or updates this PC's copy and starts it.
+
 Settings: `%APPDATA%\BrightLock\settings.txt` (`poll` = seconds between checks).
 
 License: MIT (see LICENSE).
