@@ -14,14 +14,22 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+[assembly: System.Reflection.AssemblyTitle("BrightLock")]
+[assembly: System.Reflection.AssemblyProduct("BrightLock")]
+[assembly: System.Reflection.AssemblyVersion(BrightLock.Program.Version)]
+[assembly: System.Reflection.AssemblyFileVersion(BrightLock.Program.Version)]
+
 namespace BrightLock
 {
     static class Program
     {
+        public const string Version = "1.0.0";
+
         [STAThread]
         static void Main(string[] args)
         {
             if (args.Length == 2 && args[0] == "--make-icon") { IconArt.WriteIco(args[1]); return; }
+            if (args.Length >= 1 && args[0] == "--uninstall") { Uninstaller.Run(args.Contains("--quiet")); return; }
 
             bool created;
             using (var mutex = new Mutex(true, "BrightLock.SingleInstance", out created))
@@ -1276,7 +1284,7 @@ namespace BrightLock
         readonly NotifyIcon tray;
         readonly ToolStripMenuItem startupItem;
         readonly System.Windows.Forms.Timer saveTimer, rescanTimer, healthTimer, warmTimer;
-        readonly EventWaitHandle showSignal;
+        readonly EventWaitHandle showSignal, exitSignal;
         List<Mon> mons = new List<Mon>();
         bool scanning, rescanAgain, exiting;
         Dictionary<string, DisplayCfg.Target> hdr = new Dictionary<string, DisplayCfg.Target>();
@@ -1331,6 +1339,9 @@ namespace BrightLock
 
             showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "BrightLock.Show");
             ThreadPool.RegisterWaitForSingleObject(showSignal, (o, t) => OnUi(ShowPopup), null, -1, false);
+            // The installer and uninstaller set this to close the running copy cleanly.
+            exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "BrightLock.Exit");
+            ThreadPool.RegisterWaitForSingleObject(exitSignal, (o, t) => OnUi(Exit), null, -1, true);
 
             Log.Write("Started");
             popup.Build(mons, true, store.Linked, offList);
